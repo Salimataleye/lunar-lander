@@ -3,11 +3,17 @@
 import itertools
 import numpy as np
 from collections import namedtuple, deque
+from pathlib import Path
 import random
 import torch
 from torch import nn
 import copy
-import h5py
+try:
+    import h5py
+except ImportError:  # pragma: no cover - legacy I/O path only
+    h5py = None
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalCallback
 device = torch.device("cpu") 
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #device = 'mps'
@@ -643,6 +649,8 @@ class agent_base():
 
     def save_dictionary(self,dictionary,filename):
         """Save a dictionary in hdf5 format"""
+        if h5py is None:
+            raise RuntimeError('h5py is required for legacy HDF5 save support.')
 
         with h5py.File(filename, 'w') as hf:
             self.save_dictionary_recursively(h5file=hf,
@@ -663,6 +671,8 @@ class agent_base():
                 h5file[path + str(key)] = value
 
     def load_dictionary(self,filename):
+        if h5py is None:
+            raise RuntimeError('h5py is required for legacy HDF5 load support.')
         with h5py.File(filename, 'r') as hf:
             return self.load_dictionary_recursively(h5file=hf,
                                                     path='/')
@@ -1069,3 +1079,257 @@ class actor_critic(agent_base):
         #
 
 
+DEFAULT_AGENT_HYPERPARAMETERS = {
+    'learning_rate': 3e-4,
+    'n_steps': 1024,
+    'batch_size': 64,
+    'n_epochs': 10,
+    'gamma': 0.99,
+    'gae_lambda': 0.98,
+    'ent_coef': 0.01,
+    'vf_coef': 0.5,
+    'max_grad_norm': 0.5,
+    'policy_kwargs': {'net_arch': {'pi': [256, 256], 'vf': [256, 256]}},
+}
+
+
+def linear_schedule(initial_value):
+
+    def schedule(progress_remaining):
+        return progress_remaining * initial_value
+
+    return schedule
+
+
+def constant_schedule(value):
+
+    def schedule(_progress_remaining):
+        return value
+
+    return schedule
+
+
+class EpisodeStatsCallback(BaseCallback):
+
+    def __init__(self, print_every=20):
+        super().__init__()
+        self.print_every = print_every
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.history = []
+
+    def _on_step(self):
+        for info in self.locals.get('infos', []):
+            episode = info.get('episode')
+            if episode is None:
+                continue
+
+            reward = float(episode['r'])
+            length = int(episode['l'])
+            self.episode_rewards.append(reward)
+            self.episode_lengths.append(length)
+
+            summary = {
+                'episode': len(self.episode_rewards),
+                'reward': reward,
+                'length': length,
+                'avg_reward_100': float(np.mean(self.episode_rewards[-100:])),
+                'avg_length_100': float(np.mean(self.episode_lengths[-100:])),
+                'timesteps': int(self.num_timesteps),
+            }
+            self.history.append(summary)
+
+            if summary['episode'] % self.print_every == 0:
+                print(
+                    'Episode {episode:4d} | reward {reward:8.2f} | '
+                    'avg_reward_100 {avg_reward_100:8.2f} | '
+                    'avg_length_100 {avg_length_100:7.2f}'.format(**summary)
+                )
+        return True
+
+
+class LunarLanderAgent:
+
+    def __init__(self, seed=42, verbose=0, device='auto', **hyperparameters):
+        self.seed = seed
+        self.verbose = verbose
+        self.device = device
+        self.hyperparameters = copy.deepcopy(DEFAULT_AGENT_HYPERPARAMETERS)
+        self.hyperparameters.update(hyperparameters)
+        self.model = None
+
+    def _build_model(self, env):
+        self.model = PPO(
+            policy='MlpPolicy',
+            env=env,
+            seed=self.seed,
+            verbose=self.verbose,
+            device=self.device,
+            **self.hyperparameters,
+        )
+        return self.model
+
+    def train(
+        self,
+        train_env,
+        total_timesteps,
+        eval_env,
+        eval_freq,
+        n_eval_episodes,
+        best_model_dir,
+        print_every=20,
+        progress_bar=False,
+    ):
+        best_model_dir = Path(best_model_dir)
+        best_model_dir.mkdir(parents=True, exist_ok=True)
+        starting_timesteps = 0
+
+        if self.model is None:
+            self._build_model(train_env)
+        else:
+            starting_timesteps = int(self.model.num_timesteps)
+            self.model.set_env(train_env)
+
+        training_callback = EpisodeStatsCallback(print_every=print_every)
+        eval_callback = EvalCallback(
+            eval_env=eval_env,
+            best_model_save_path=str(best_model_dir),
+            log_path=str(best_model_dir),
+            eval_freq=eval_freq,
+            n_eval_episodes=n_eval_episodes,
+            deterministic=True,
+            render=False,
+            verbose=0,
+        )
+
+        self.model.learn(
+            total_timesteps=total_timesteps,
+            callback=CallbackList([training_callback, eval_callback]),
+            progress_bar=progress_bar,
+            reset_num_timesteps=False,
+        )
+
+        history = training_callback.history
+        if history:
+            final_train_stats = history[-1]
+        else:
+            final_train_stats = {
+                'episode': 0,
+                'reward': 0.0,
+                'length': 0,
+                'avg_reward_100': 0.0,
+                'avg_length_100': 0.0,
+                'timesteps': int(total_timesteps),
+            }
+
+        best_mean_reward = float(eval_callback.best_mean_reward)
+        if not np.isfinite(best_mean_reward):
+            best_mean_reward = None
+
+        evaluation_history = []
+        best_model_timestep = None
+        best_model_timestep_in_run = None
+        if hasattr(eval_callback, 'evaluations_results') and len(eval_callback.evaluations_results) > 0:
+            evaluation_history = [
+                {
+                    'timestep': int(timestep),
+                    'mean_reward': float(np.mean(rewards)),
+                }
+                for timestep, rewards in zip(
+                    eval_callback.evaluations_timesteps,
+                    eval_callback.evaluations_results,
+                )
+            ]
+            best_model_timestep = evaluation_history[
+                int(np.argmax([entry['mean_reward'] for entry in evaluation_history]))
+            ]['timestep']
+            best_model_timestep_in_run = best_model_timestep - starting_timesteps
+
+        return {
+            'starting_timesteps': starting_timesteps,
+            'timesteps_trained_this_run': int(self.model.num_timesteps) - starting_timesteps,
+            'episodes': len(training_callback.episode_rewards),
+            'episode_rewards': training_callback.episode_rewards,
+            'episode_lengths': training_callback.episode_lengths,
+            'history': history,
+            'evaluation_history': evaluation_history,
+            'final_train_stats': final_train_stats,
+            'best_mean_reward': best_mean_reward,
+            'best_model_timestep': best_model_timestep,
+            'best_model_timestep_in_run': best_model_timestep_in_run,
+            'best_model_path': str(best_model_dir / 'best_model.zip'),
+            'total_timesteps': int(self.model.num_timesteps),
+        }
+
+    def predict(self, observation, deterministic=True):
+        if self.model is None:
+            raise RuntimeError('The model has not been initialized yet.')
+        action, _ = self.model.predict(observation, deterministic=deterministic)
+        return int(action)
+
+    def evaluate(self, num_episodes=10, render=False):
+        from env_setup import make_env
+
+        if self.model is None:
+            raise RuntimeError('The model has not been initialized yet.')
+
+        env = make_env(render=render, seed=self.seed)
+        rewards = []
+        lengths = []
+
+        for episode_idx in range(num_episodes):
+            observation, info = env.reset(seed=self.seed + episode_idx)
+            total_reward = 0.0
+            steps = 0
+            done = False
+
+            while not done:
+                action = self.predict(observation, deterministic=True)
+                observation, reward, terminated, truncated, info = env.step(action)
+                total_reward += reward
+                steps += 1
+                done = terminated or truncated
+
+            rewards.append(total_reward)
+            lengths.append(steps)
+
+        env.close()
+        return {
+            'num_episodes': num_episodes,
+            'episode_rewards': [float(reward) for reward in rewards],
+            'episode_lengths': lengths,
+            'mean_reward': float(np.mean(rewards)),
+            'std_reward': float(np.std(rewards)),
+            'mean_length': float(np.mean(lengths)),
+        }
+
+    def save(self, path):
+        if self.model is None:
+            raise RuntimeError('The model has not been initialized yet.')
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.model.save(path)
+
+    @classmethod
+    def load(
+        cls,
+        path,
+        env=None,
+        seed=42,
+        verbose=0,
+        device='auto',
+        custom_objects=None,
+        **hyperparameters,
+    ):
+        agent = cls(
+            seed=seed,
+            verbose=verbose,
+            device=device,
+            **hyperparameters,
+        )
+        agent.model = PPO.load(
+            path,
+            env=env,
+            device=device,
+            custom_objects=custom_objects,
+        )
+        return agent
