@@ -13,7 +13,8 @@ try:
 except ImportError:  # pragma: no cover - legacy I/O path only
     h5py = None
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+from stable_baselines3.common.evaluation import evaluate_policy
 device = torch.device("cpu") 
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #device = 'mps'
@@ -1148,6 +1149,108 @@ class EpisodeStatsCallback(BaseCallback):
         return True
 
 
+class RobustEvalCallback(BaseCallback):
+
+    def __init__(
+        self,
+        eval_env,
+        best_model_save_path,
+        eval_freq,
+        n_eval_episodes=20,
+        deterministic=True,
+        robustness_penalty=0.25,
+        length_penalty=0.0,
+        selection_metric='robust_reward',
+        evaluate_initial_model=False,
+    ):
+        super().__init__()
+        self.eval_env = eval_env
+        self.best_model_save_path = Path(best_model_save_path)
+        self.eval_freq = eval_freq
+        self.n_eval_episodes = n_eval_episodes
+        self.deterministic = deterministic
+        self.robustness_penalty = robustness_penalty
+        self.length_penalty = length_penalty
+        self.selection_metric = selection_metric
+        self.evaluate_initial_model = evaluate_initial_model
+        self.history = []
+        self.best_score = -np.inf
+        self.best_mean_reward = -np.inf
+        self.best_std_reward = None
+        self.best_timestep = None
+        self.best_model_save_path.mkdir(parents=True, exist_ok=True)
+
+    def _evaluate_current_model(self, timestep):
+        episode_rewards, episode_lengths = evaluate_policy(
+            self.model,
+            self.eval_env,
+            n_eval_episodes=self.n_eval_episodes,
+            deterministic=self.deterministic,
+            return_episode_rewards=True,
+            warn=False,
+        )
+        mean_reward = float(np.mean(episode_rewards))
+        std_reward = float(np.std(episode_rewards))
+        mean_length = float(np.mean(episode_lengths))
+        efficiency_score = 0.0
+        if mean_length > 0:
+            efficiency_score = float((mean_reward ** 2) / mean_length)
+
+        robust_reward_score = mean_reward - self.robustness_penalty * std_reward
+        robust_reward_length_score = (
+            robust_reward_score - self.length_penalty * mean_length
+        )
+        lcb_reward = max(mean_reward - self.robustness_penalty * std_reward, 0.0)
+        lcb_efficiency_score = 0.0
+        if mean_length > 0:
+            lcb_efficiency_score = float((lcb_reward ** 2) / mean_length)
+
+        robust_efficiency_score = efficiency_score - self.robustness_penalty * std_reward
+        if self.selection_metric == 'robust_reward':
+            checkpoint_score = robust_reward_score
+        elif self.selection_metric == 'robust_reward_length':
+            checkpoint_score = robust_reward_length_score
+        elif self.selection_metric == 'lcb_efficiency':
+            checkpoint_score = lcb_efficiency_score
+        elif self.selection_metric == 'robust_efficiency':
+            checkpoint_score = robust_efficiency_score
+        else:
+            checkpoint_score = efficiency_score
+
+        entry = {
+            'timestep': int(timestep),
+            'mean_reward': mean_reward,
+            'std_reward': std_reward,
+            'mean_length': mean_length,
+            'efficiency_score': efficiency_score,
+            'robust_reward_length_score': robust_reward_length_score,
+            'lcb_reward': lcb_reward,
+            'lcb_efficiency_score': lcb_efficiency_score,
+            'robust_reward_score': robust_reward_score,
+            'robust_efficiency_score': robust_efficiency_score,
+            'checkpoint_score': checkpoint_score,
+        }
+        self.history.append(entry)
+
+        if checkpoint_score > self.best_score:
+            self.best_score = checkpoint_score
+            self.best_mean_reward = mean_reward
+            self.best_std_reward = std_reward
+            self.best_timestep = int(timestep)
+            self.model.save(self.best_model_save_path / 'best_model.zip')
+
+    def _on_training_start(self):
+        if self.evaluate_initial_model:
+            self._evaluate_current_model(self.model.num_timesteps)
+
+    def _on_step(self):
+        if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
+            return True
+
+        self._evaluate_current_model(self.num_timesteps)
+        return True
+
+
 class LunarLanderAgent:
 
     def __init__(self, seed=42, verbose=0, device='auto', **hyperparameters):
@@ -1179,6 +1282,10 @@ class LunarLanderAgent:
         best_model_dir,
         print_every=20,
         progress_bar=False,
+        robustness_penalty=0.25,
+        length_penalty=0.0,
+        selection_metric='robust_reward',
+        evaluate_initial_model=False,
     ):
         best_model_dir = Path(best_model_dir)
         best_model_dir.mkdir(parents=True, exist_ok=True)
@@ -1191,15 +1298,16 @@ class LunarLanderAgent:
             self.model.set_env(train_env)
 
         training_callback = EpisodeStatsCallback(print_every=print_every)
-        eval_callback = EvalCallback(
+        eval_callback = RobustEvalCallback(
             eval_env=eval_env,
             best_model_save_path=str(best_model_dir),
-            log_path=str(best_model_dir),
             eval_freq=eval_freq,
             n_eval_episodes=n_eval_episodes,
             deterministic=True,
-            render=False,
-            verbose=0,
+            robustness_penalty=robustness_penalty,
+            length_penalty=length_penalty,
+            selection_metric=selection_metric,
+            evaluate_initial_model=evaluate_initial_model,
         )
 
         self.model.learn(
@@ -1226,23 +1334,18 @@ class LunarLanderAgent:
         if not np.isfinite(best_mean_reward):
             best_mean_reward = None
 
-        evaluation_history = []
-        best_model_timestep = None
+        best_checkpoint_score = float(eval_callback.best_score)
+        if not np.isfinite(best_checkpoint_score):
+            best_checkpoint_score = None
+
+        best_std_reward = eval_callback.best_std_reward
+        if best_std_reward is not None:
+            best_std_reward = float(best_std_reward)
+
+        evaluation_history = eval_callback.history
+        best_model_timestep = eval_callback.best_timestep
         best_model_timestep_in_run = None
-        if hasattr(eval_callback, 'evaluations_results') and len(eval_callback.evaluations_results) > 0:
-            evaluation_history = [
-                {
-                    'timestep': int(timestep),
-                    'mean_reward': float(np.mean(rewards)),
-                }
-                for timestep, rewards in zip(
-                    eval_callback.evaluations_timesteps,
-                    eval_callback.evaluations_results,
-                )
-            ]
-            best_model_timestep = evaluation_history[
-                int(np.argmax([entry['mean_reward'] for entry in evaluation_history]))
-            ]['timestep']
+        if best_model_timestep is not None:
             best_model_timestep_in_run = best_model_timestep - starting_timesteps
 
         return {
@@ -1255,6 +1358,9 @@ class LunarLanderAgent:
             'evaluation_history': evaluation_history,
             'final_train_stats': final_train_stats,
             'best_mean_reward': best_mean_reward,
+            'best_std_reward': best_std_reward,
+            'best_checkpoint_score': best_checkpoint_score,
+            'selection_metric': selection_metric,
             'best_model_timestep': best_model_timestep,
             'best_model_timestep_in_run': best_model_timestep_in_run,
             'best_model_path': str(best_model_dir / 'best_model.zip'),

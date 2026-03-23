@@ -21,26 +21,30 @@ def make_training_env(n_envs=1, seed=42):
 
 def train(
     iteration=1,
-    total_timesteps=300000,
+    total_timesteps=500000,
     seed=42,
     eval_freq=10000,
-    eval_episodes=10,
+    eval_episodes=20,
     test_episodes=20,
     print_every=20,
     progress_bar=False,
     best_model_path=None,
-    n_envs=4,
+    n_envs=1,
     learning_rate=3e-4,
-    learning_rate_schedule='linear',
+    learning_rate_schedule='constant',
     n_steps=1024,
-    batch_size=256,
+    batch_size=64,
     n_epochs=10,
     gamma=0.99,
     gae_lambda=0.98,
-    ent_coef=0.005,
+    ent_coef=0.01,
     clip_range=0.2,
     target_kl=None,
     initial_model_path=None,
+    robustness_penalty=0.25,
+    length_penalty=0.0,
+    selection_metric='robust_reward',
+    evaluate_initial_model=False,
 ):
     train_env = make_training_env(n_envs=n_envs, seed=seed)
     eval_env = make_monitored_env(seed=seed + 1000)
@@ -84,6 +88,10 @@ def train(
             best_model_dir=tmp_dir,
             print_every=print_every,
             progress_bar=progress_bar,
+            robustness_penalty=robustness_penalty,
+            length_penalty=length_penalty,
+            selection_metric=selection_metric,
+            evaluate_initial_model=evaluate_initial_model,
         )
 
         if best_model_path is None:
@@ -114,6 +122,9 @@ def train(
         'episodes_seen': training_summary['episodes'],
         'final_train_stats': training_summary['final_train_stats'],
         'best_mean_reward': training_summary['best_mean_reward'],
+        'best_std_reward': training_summary['best_std_reward'],
+        'best_checkpoint_score': training_summary['best_checkpoint_score'],
+        'selection_metric': training_summary['selection_metric'],
         'best_model_timestep': training_summary['best_model_timestep'],
         'best_model_timestep_in_run': training_summary['best_model_timestep_in_run'],
         'best_model_path': str(best_model_path),
@@ -129,6 +140,10 @@ def train(
             'ent_coef': ent_coef,
             'clip_range': clip_range,
             'target_kl': target_kl,
+            'robustness_penalty': robustness_penalty,
+            'length_penalty': length_penalty,
+            'selection_metric': selection_metric,
+            'evaluate_initial_model': evaluate_initial_model,
         },
         'evaluation': evaluation_summary,
     }
@@ -146,24 +161,28 @@ def test(agent=None, model_path=None, num_episodes=10, render=False, seed=42):
 def build_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--iteration', type=int, default=1)
-    parser.add_argument('--timesteps', type=int, default=300000)
+    parser.add_argument('--timesteps', type=int, default=500000)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--eval-freq', type=int, default=10000)
-    parser.add_argument('--eval-episodes', type=int, default=10)
+    parser.add_argument('--eval-episodes', type=int, default=20)
     parser.add_argument('--test-episodes', type=int, default=20)
     parser.add_argument('--print-every', type=int, default=20)
-    parser.add_argument('--n-envs', type=int, default=4)
+    parser.add_argument('--n-envs', type=int, default=1)
     parser.add_argument('--learning-rate', type=float, default=3e-4)
-    parser.add_argument('--learning-rate-schedule', choices=['constant', 'linear'], default='linear')
+    parser.add_argument('--learning-rate-schedule', choices=['constant', 'linear'], default='constant')
     parser.add_argument('--n-steps', type=int, default=1024)
-    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--n-epochs', type=int, default=10)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--gae-lambda', type=float, default=0.98)
-    parser.add_argument('--ent-coef', type=float, default=0.005)
+    parser.add_argument('--ent-coef', type=float, default=0.01)
     parser.add_argument('--clip-range', type=float, default=0.2)
     parser.add_argument('--target-kl', type=float)
+    parser.add_argument('--robustness-penalty', type=float, default=0.25)
+    parser.add_argument('--length-penalty', type=float, default=0.0)
+    parser.add_argument('--selection-metric', choices=['efficiency', 'lcb_efficiency', 'robust_efficiency', 'robust_reward', 'robust_reward_length'], default='robust_reward')
     parser.add_argument('--initial-model-path', type=str)
+    parser.add_argument('--evaluate-initial-model', action='store_true')
     parser.add_argument('--progress-bar', action='store_true')
     parser.add_argument('--render', action='store_true')
     return parser
@@ -192,6 +211,10 @@ if __name__ == '__main__':
         clip_range=args.clip_range,
         target_kl=args.target_kl,
         initial_model_path=args.initial_model_path,
+        robustness_penalty=args.robustness_penalty,
+        length_penalty=args.length_penalty,
+        selection_metric=args.selection_metric,
+        evaluate_initial_model=args.evaluate_initial_model,
     )
     print(json.dumps(summary, indent=2))
 
